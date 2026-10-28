@@ -37,7 +37,7 @@ import java.util.Map;
     description = """
         Runs one server-side hybrid query against a collection that holds both a named dense vector space and a named sparse vector space.
 
-        The task sends a single `QueryPoints` request with two prefetch branches, one per vector space, each bounded by its own candidate limit, and asks Qdrant to merge the two candidate lists with native Reciprocal Rank Fusion. Fusion happens inside Qdrant, so no scoring is done by Kestra.
+        The task sends a single `QueryPoints` request with two prefetch branches, one per vector space, each bounded by its own candidate limit, and asks Qdrant to merge the two candidate lists with native Reciprocal Rank Fusion by default, or Distribution-Based Score Fusion with `fusion: DBSF`. Fusion happens inside Qdrant, so no scoring is done by Kestra.
 
         The collection must already expose the dense and the sparse vector space under the names given here. Create it with the `CreateCollection` task (`vectorName` and `sparseVectors`) and load it with the `Upsert` task, which accepts sparse vectors. Hybrid retrieval is opt-in: the existing `Query` task is unchanged, and fusion does not improve every workload, so compare it with dense-only retrieval on your own labelled queries before adopting it."""
 )
@@ -78,6 +78,49 @@ import java.util.Map;
                   - id: log_hits
                     type: io.kestra.plugin.core.log.Log
                     message: "{{ outputs.hybrid_search.rows }}"
+                """
+        ),
+        @Example(
+            title = "Tune the fusion: weight the sparse branch higher in RRF (needs Qdrant 1.17 or later), or switch to DBSF, and read the second page of results",
+            full = true,
+            code = """
+                id: qdrant_hybrid_query_tuned
+                namespace: company.team
+
+                tasks:
+                  - id: rrf_sparse_heavy
+                    type: io.kestra.plugin.qdrant.HybridQuery
+                    host: "{{ secret('QDRANT_HOST') }}"
+                    apiKey: "{{ secret('QDRANT_API_KEY') }}"
+                    tlsEnabled: true
+                    collectionName: docs
+                    denseVectorName: text_dense
+                    denseVector: [0.9, 0.1, 0.0, 0.0]
+                    sparseVectorName: text_sparse
+                    sparseIndices: [12, 104, 982]
+                    sparseValues: [0.84, 1.23, 0.41]
+                    rrfK: 5
+                    denseWeight: 1.0
+                    sparseWeight: 2.0
+                    limit: 10
+                    fetchType: FETCH
+
+                  - id: dbsf_second_page
+                    type: io.kestra.plugin.qdrant.HybridQuery
+                    host: "{{ secret('QDRANT_HOST') }}"
+                    apiKey: "{{ secret('QDRANT_API_KEY') }}"
+                    tlsEnabled: true
+                    collectionName: docs
+                    denseVectorName: text_dense
+                    denseVector: [0.9, 0.1, 0.0, 0.0]
+                    sparseVectorName: text_sparse
+                    sparseIndices: [12, 104, 982]
+                    sparseValues: [0.84, 1.23, 0.41]
+                    fusion: DBSF
+                    limit: 10
+                    offset: 10
+                    candidateLimit: 50
+                    fetchType: FETCH
                 """
         ),
         @Example(
@@ -277,6 +320,9 @@ public class HybridQuery extends QdrantConnection implements RunnableTask<FetchO
     private static final int DEFAULT_CANDIDATE_LIMIT = 50;
     private static final int MAX_LIMIT = 1000;
     private static final int MAX_CANDIDATE_LIMIT = 10000;
+    private static final int MAX_OFFSET = 10000;
+    private static final int MAX_RRF_K = 10000;
+    private static final float MAX_RRF_WEIGHT = 1000f;
     private static final Duration DEFAULT_QUERY_TIMEOUT = Duration.ofSeconds(30);
 
     @Schema(
@@ -343,7 +389,7 @@ public class HybridQuery extends QdrantConnection implements RunnableTask<FetchO
         title = "Candidate limit per branch",
         description = """
             Maximum number of candidates each prefetch branch returns to the fusion step (default: 50, min: 1, \
-            max: 10000). Must be greater than or equal to 'limit'. Overridden per branch by \
+            max: 10000). Must be greater than or equal to 'limit' plus 'offset'. Overridden per branch by \
             'denseCandidateLimit' and 'sparseCandidateLimit'."""
     )
     @Builder.Default
@@ -376,6 +422,61 @@ public class HybridQuery extends QdrantConnection implements RunnableTask<FetchO
     @Builder.Default
     @PluginProperty(group = "processing")
     private Property<Integer> limit = Property.ofValue(DEFAULT_LIMIT);
+
+    @Schema(
+        title = "Skip fused results",
+        description = """
+            Number of fused results to skip before returning `limit` points, for pagination (default: 0, max: 10000). \
+            Every candidate limit must be at least `limit + offset`, because fusion has to rank the skipped points too."""
+    )
+    @Builder.Default
+    @PluginProperty(group = "processing")
+    private Property<Integer> offset = Property.ofValue(0);
+
+    @Schema(
+        title = "Fusion method",
+        description = """
+            How the two candidate lists are merged: `RRF` (default) scores a point from its rank in each branch, \
+            `DBSF` normalizes each branch score distribution and sums the normalized scores. The returned `score` is \
+            the fusion score for either method."""
+    )
+    @Builder.Default
+    @NotNull
+    @PluginProperty(group = "processing")
+    private Property<FusionMethod> fusion = Property.ofValue(FusionMethod.RRF);
+
+    @Schema(
+        title = "RRF rank constant",
+        description = """
+            The `k` constant of Reciprocal Rank Fusion (min: 1, max: 10000). With equal weights a point at \
+            zero-based position `pos` in a branch scores `1 / (pos + k)`, so a larger `k` flattens the gap between \
+            top ranks. Unset keeps the Qdrant default of 2. Use 61 to reproduce the `1 / (rank + 60)` convention of \
+            the original RRF paper. Only valid with `fusion: RRF`, and needs Qdrant 1.17 or later."""
+    )
+    @PluginProperty(group = "advanced")
+    private Property<Integer> rrfK;
+
+    @Schema(
+        title = "RRF weight of the dense branch",
+        description = """
+            Weight of the dense branch in Reciprocal Rank Fusion (min: 0, max: 1000). Weights are absolute, not \
+            relative: `1` and `2` is a different setting from `2` and `4`, because the position is divided by the \
+            weight. A weight of `0` keeps the branch candidates at the bottom with a score of 0. Unset keeps the \
+            Qdrant default of 1. Only valid with `fusion: RRF`, must be set together with `sparseWeight`, and needs \
+            Qdrant 1.17 or later."""
+    )
+    @PluginProperty(group = "advanced")
+    private Property<Float> denseWeight;
+
+    @Schema(
+        title = "RRF weight of the sparse branch",
+        description = """
+            Weight of the sparse branch in Reciprocal Rank Fusion (min: 0, max: 1000). Weights are absolute, not \
+            relative, as described for `denseWeight`. Unset keeps the Qdrant default of 1. Only valid with \
+            `fusion: RRF`, must be set together with `denseWeight`, and needs Qdrant 1.17 or later."""
+    )
+    @PluginProperty(group = "advanced")
+    private Property<Float> sparseWeight;
 
     @Schema(
         title = "Filter criteria",
@@ -457,9 +558,15 @@ public class HybridQuery extends QdrantConnection implements RunnableTask<FetchO
         var rDenseCandidateLimit = renderBoundedLimit(runContext, this.denseCandidateLimit, "denseCandidateLimit", rCandidateLimit, MAX_CANDIDATE_LIMIT);
         var rSparseCandidateLimit = renderBoundedLimit(runContext, this.sparseCandidateLimit, "sparseCandidateLimit", rCandidateLimit, MAX_CANDIDATE_LIMIT);
 
-        requireCandidateBudget("candidateLimit", rCandidateLimit, rLimit);
-        requireCandidateBudget("denseCandidateLimit", rDenseCandidateLimit, rLimit);
-        requireCandidateBudget("sparseCandidateLimit", rSparseCandidateLimit, rLimit);
+        var rOffset = renderBoundedOffset(runContext, this.offset);
+        var rWindow = rLimit + rOffset;
+
+        requireCandidateBudget("candidateLimit", rCandidateLimit, rWindow);
+        requireCandidateBudget("denseCandidateLimit", rDenseCandidateLimit, rWindow);
+        requireCandidateBudget("sparseCandidateLimit", rSparseCandidateLimit, rWindow);
+
+        var rFusion = runContext.render(this.fusion).as(FusionMethod.class).orElse(FusionMethod.RRF);
+        var fusionQuery = fusionQuery(runContext, rFusion);
 
         var rWithPayload = runContext.render(this.withPayload).as(Boolean.class).orElse(true);
         var rWithVectors = runContext.render(this.withVectors).as(Boolean.class).orElse(false);
@@ -494,8 +601,9 @@ public class HybridQuery extends QdrantConnection implements RunnableTask<FetchO
             .setCollectionName(rCollectionName)
             .addPrefetch(densePrefetch)
             .addPrefetch(sparsePrefetch)
-            .setQuery(QueryFactory.fusion(Points.Fusion.RRF))
+            .setQuery(fusionQuery)
             .setLimit(rLimit)
+            .setOffset(rOffset)
             .setTimeout(rTimeoutSeconds)
             .setWithPayload(WithPayloadSelectorFactory.enable(rWithPayload))
             .setWithVectors(WithVectorsSelectorFactory.enable(rWithVectors));
@@ -506,8 +614,8 @@ public class HybridQuery extends QdrantConnection implements RunnableTask<FetchO
 
         try (var client = buildClient(runContext)) {
             runContext.logger().info(
-                "Hybrid querying collection '{}' with dense branch '{}' (candidates={}), sparse branch '{}' (candidates={}), RRF fusion, limit={} and timeout={}",
-                rCollectionName, rDenseVectorName, rDenseCandidateLimit, rSparseVectorName, rSparseCandidateLimit, rLimit, rQueryTimeout
+                "Hybrid querying collection '{}' with dense branch '{}' (candidates={}), sparse branch '{}' (candidates={}), {} fusion, limit={}, offset={} and timeout={}",
+                rCollectionName, rDenseVectorName, rDenseCandidateLimit, rSparseVectorName, rSparseCandidateLimit, rFusion, rLimit, rOffset, rQueryTimeout
             );
 
             var results = client.queryAsync(queryBuilder.build(), rQueryTimeout).get();
@@ -537,12 +645,61 @@ public class HybridQuery extends QdrantConnection implements RunnableTask<FetchO
         return rLimit;
     }
 
-    private static void requireCandidateBudget(String name, int candidateLimit, int limit) {
-        if (candidateLimit < limit) {
+    private static int renderBoundedOffset(RunContext runContext, Property<Integer> property)
+        throws IllegalVariableEvaluationException {
+        if (property == null) {
+            return 0;
+        }
+        var rOffset = runContext.render(property).as(Integer.class).orElse(0);
+        validateRange("offset", rOffset, 0, MAX_OFFSET);
+        return rOffset;
+    }
+
+    private static void requireCandidateBudget(String name, int candidateLimit, int window) {
+        if (candidateLimit < window) {
             throw new IllegalArgumentException(
-                "'" + name + "' must be greater than or equal to 'limit' so fusion has enough candidates, got: "
-                    + candidateLimit + " candidates for a limit of " + limit
+                "'" + name + "' must be greater than or equal to 'limit' plus 'offset' so fusion has enough candidates, got: "
+                    + candidateLimit + " candidates for a window of " + window
             );
         }
+    }
+
+    private Points.Query fusionQuery(RunContext runContext, FusionMethod rFusion) throws IllegalVariableEvaluationException {
+        var rRrfK = this.rrfK == null ? null : runContext.render(this.rrfK).as(Integer.class).orElse(null);
+        var rDenseWeight = this.denseWeight == null ? null : runContext.render(this.denseWeight).as(Float.class).orElse(null);
+        var rSparseWeight = this.sparseWeight == null ? null : runContext.render(this.sparseWeight).as(Float.class).orElse(null);
+        var tuned = rRrfK != null || rDenseWeight != null || rSparseWeight != null;
+
+        if (rFusion == FusionMethod.DBSF) {
+            if (tuned) {
+                throw new IllegalArgumentException("'rrfK', 'denseWeight' and 'sparseWeight' only apply to 'fusion: RRF', but 'fusion' is DBSF");
+            }
+            return QueryFactory.fusion(rFusion.toGrpc());
+        }
+        if (!tuned) {
+            return QueryFactory.fusion(rFusion.toGrpc());
+        }
+        if ((rDenseWeight == null) != (rSparseWeight == null)) {
+            throw new IllegalArgumentException("'denseWeight' and 'sparseWeight' must be set together, because Qdrant takes one weight per branch");
+        }
+
+        var rrf = Points.Rrf.newBuilder();
+        if (rRrfK != null) {
+            validateRange("rrfK", rRrfK, 1, MAX_RRF_K);
+            rrf.setK(rRrfK);
+        }
+        if (rDenseWeight != null) {
+            // weights are positional: the dense prefetch is added first, the sparse prefetch second
+            rrf.addWeights(requireWeight("denseWeight", rDenseWeight));
+            rrf.addWeights(requireWeight("sparseWeight", rSparseWeight));
+        }
+        return QueryFactory.rrf(rrf.build());
+    }
+
+    private static float requireWeight(String name, float weight) {
+        if (Float.isNaN(weight) || Float.isInfinite(weight) || weight < 0 || weight > MAX_RRF_WEIGHT) {
+            throw new IllegalArgumentException("'" + name + "' must be a finite number between 0 and " + (int) MAX_RRF_WEIGHT + ", got: " + weight);
+        }
+        return weight;
     }
 }

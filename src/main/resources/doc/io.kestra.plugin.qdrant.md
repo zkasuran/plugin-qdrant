@@ -25,7 +25,7 @@ All tasks inherit common connection properties:
 
 ## Hybrid retrieval
 
-`HybridQuery` sends one `QueryPoints` request containing two prefetch branches, one per vector space, and a fusion query. Qdrant ranks each branch, then merges the two ranked lists with native Reciprocal Rank Fusion and returns the fused top results. Scoring and fusion happen inside Qdrant, so the returned `score` is the fusion score, not a cosine or dot product similarity, and it is not comparable with a `Query` score.
+`HybridQuery` sends one `QueryPoints` request containing two prefetch branches, one per vector space, and a fusion query. Qdrant ranks each branch, then merges the two ranked lists with native Reciprocal Rank Fusion (default) or Distribution-Based Score Fusion and returns the fused top results. Scoring and fusion happen inside Qdrant, so the returned `score` is the fusion score, not a cosine or dot product similarity, and it is not comparable with a `Query` score.
 
 ### Requirements
 
@@ -39,13 +39,20 @@ All tasks inherit common connection properties:
 
 ### Limits
 
-- `limit` bounds the fused result (default `10`, from `1` to `1000`).
-- `candidateLimit` bounds how many candidates each branch hands to fusion (default `50`, from `1` to `10000`). `denseCandidateLimit` and `sparseCandidateLimit` override it per branch. Every effective candidate limit must be greater than or equal to `limit`, so fusion always has enough candidates to fill the requested result. Raising the candidate limits gives fusion a wider view at the cost of more work per branch.
+- `limit` bounds the fused result (default `10`, from `1` to `1000`). `offset` skips that many fused results for pagination (default `0`, up to `10000`).
+- `candidateLimit` bounds how many candidates each branch hands to fusion (default `50`, from `1` to `10000`). `denseCandidateLimit` and `sparseCandidateLimit` override it per branch. Every effective candidate limit must be greater than or equal to `limit + offset`, so fusion always has enough candidates to rank the skipped points and fill the requested page. Raising the candidate limits gives fusion a wider view at the cost of more work per branch.
 - `queryTimeout` defaults to `PT30S`, is truncated to whole seconds (minimum 1 second) and bounds both the server-side request and the gRPC call deadline, so a stalled server or network cannot hold a worker thread indefinitely. Raise it for very large candidate limits. The per-run gRPC client is closed when the task ends.
 
 ### Filters
 
 `filter` accepts the same shapes as `Query` and is applied to both prefetch branches and to the fused query, so a point excluded by the filter can enter neither candidate list. Because the filter changes each branch ranking, filtered fusion scores differ from unfiltered ones for the same points. An empty result is a valid outcome in every fetch mode.
+
+### Fusion
+
+- `fusion: RRF` (default) scores a point from its position in each branch. `rrfK` sets the rank constant (Qdrant defaults to `2`, and `61` reproduces the `1 / (rank + 60)` convention of the original RRF paper). A larger value flattens the gap between top ranks. `denseWeight` and `sparseWeight` are absolute weights, not ratios: `1` and `2` is a different setting from `2` and `4`. They must be set together.
+- `fusion: DBSF` normalizes the score distribution of each branch and sums the normalized scores, so it uses the score values and not only the ranks. It takes no tuning properties: combining it with `rrfK`, `denseWeight` or `sparseWeight` fails before any network call.
+- The returned `score` is the fusion score for either method, so scores of different methods, or of `Query`, are not comparable.
+- `rrfK` and the weights need Qdrant 1.17 or later. An older server answers with its own error. Plain `fusion: RRF` and `fusion: DBSF` work on every server that supports the Query API.
 
 ### Evaluating hybrid retrieval
 
@@ -55,7 +62,7 @@ The bundled corpus and queries are synthetic and are built so that the three met
 
 ### Scope
 
-Only RRF is exposed. Distribution-Based Score Fusion and RRF parameter tuning are not part of this task. Hybrid retrieval is opt-in and `Query` is unchanged: fusion does not improve every workload, so measure dense-only against fused retrieval on your own labelled queries before adopting it.
+Hybrid retrieval is opt-in and `Query` is unchanged: fusion does not improve every workload, so measure dense-only against sparse-only and fused retrieval on your own labelled queries before adopting it.
 
 ## Filter DSL
 

@@ -35,7 +35,7 @@ Provides tasks under `io.kestra.plugin.qdrant`:
 - `Get`: Retrieve points by ID with `FETCH`, `FETCH_ONE`, or `STORE` fetch modes.
 - `Query`: Vector similarity search supporting raw vectors or point IDs, filters, score thresholds, and multiple fetch modes.
 - `SparseQuery`: Sparse-only retrieval over a named sparse vector space, the sparse counterpart of `Query`, for comparing dense-only, sparse-only and fused retrieval on labelled queries.
-- `HybridQuery`: Hybrid retrieval over a named dense vector space and a named sparse vector space, bounded per-branch candidate limits, and server-side Reciprocal Rank Fusion.
+- `HybridQuery`: Hybrid retrieval over a named dense vector space and a named sparse vector space, bounded per-branch candidate limits, pagination, and server-side Reciprocal Rank Fusion (with `k` and branch weights) or Distribution-Based Score Fusion.
 - `Delete`: Delete points by ID or matching filter criteria.
 
 ## Documentation
