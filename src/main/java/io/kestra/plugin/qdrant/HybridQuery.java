@@ -81,6 +81,152 @@ import java.util.Map;
                 """
         ),
         @Example(
+            title = "Evaluate dense-only, sparse-only and fused retrieval on a labelled query set. The flow creates a throwaway collection, loads a small corpus, scores hit@k per method and always drops the collection.",
+            full = true,
+            code = """
+                id: qdrant_retrieval_evaluation
+                namespace: company.team
+
+                variables:
+                  collection: "eval_{{ execution.id | lower }}"
+
+                inputs:
+                  - id: k
+                    type: INT
+                    defaults: 3
+                    description: A query counts as a hit when its relevant point is among the first k results of a method.
+                  - id: queries
+                    type: JSON
+                    description: Labelled queries. Each one has a dense vector, a sparse vector and the id of the point that is relevant for it.
+                    defaults: |
+                      [
+                        {"name": "exact identifier", "dense": [0.0, 0.3, 0.7, 0.0], "indices": [13], "values": [1.0], "relevant": 4},
+                        {"name": "paraphrase", "dense": [0.1, 0.9, 0.0, 0.0], "indices": [99], "values": [1.0], "relevant": 3},
+                        {"name": "both signals", "dense": [0.9, 0.1, 0.0, 0.0], "indices": [10], "values": [1.0], "relevant": 1},
+                        {"name": "keyword only", "dense": [0.25, 0.25, 0.25, 0.25], "indices": [14], "values": [1.0], "relevant": 5}
+                      ]
+
+                tasks:
+                  - id: create_collection
+                    type: io.kestra.plugin.qdrant.CreateCollection
+                    host: "{{ secret('QDRANT_HOST') }}"
+                    apiKey: "{{ secret('QDRANT_API_KEY') }}"
+                    tlsEnabled: true
+                    collectionName: "{{ render(vars.collection) }}"
+                    vectorName: text_dense
+                    vectorSize: 4
+                    distance: COSINE
+                    sparseVectors:
+                      - name: text_sparse
+
+                  - id: load_corpus
+                    type: io.kestra.plugin.qdrant.Upsert
+                    host: "{{ secret('QDRANT_HOST') }}"
+                    apiKey: "{{ secret('QDRANT_API_KEY') }}"
+                    tlsEnabled: true
+                    collectionName: "{{ render(vars.collection) }}"
+                    points:
+                      - id: 1
+                        vectors:
+                          text_dense: [1.0, 0.0, 0.0, 0.0]
+                          text_sparse: {indices: [10, 20], values: [1.0, 0.5]}
+                      - id: 2
+                        vectors:
+                          text_dense: [0.9, 0.1, 0.0, 0.0]
+                          text_sparse: {indices: [11], values: [1.0]}
+                      - id: 3
+                        vectors:
+                          text_dense: [0.0, 1.0, 0.0, 0.0]
+                          text_sparse: {indices: [12, 20], values: [1.0, 0.5]}
+                      - id: 4
+                        vectors:
+                          text_dense: [0.0, 0.1, 0.9, 0.0]
+                          text_sparse: {indices: [13], values: [2.0]}
+                      - id: 5
+                        vectors:
+                          text_dense: [0.0, 0.0, 1.0, 0.0]
+                          text_sparse: {indices: [14], values: [1.0]}
+                      - id: 6
+                        vectors:
+                          text_dense: [0.0, 0.0, 0.1, 0.9]
+                          text_sparse: {indices: [15, 13], values: [1.0, 0.2]}
+
+                  - id: evaluate
+                    type: io.kestra.plugin.core.flow.ForEach
+                    values: "{{ inputs.queries }}"
+                    tasks:
+                      - id: dense_only
+                        type: io.kestra.plugin.qdrant.Query
+                        host: "{{ secret('QDRANT_HOST') }}"
+                        apiKey: "{{ secret('QDRANT_API_KEY') }}"
+                        tlsEnabled: true
+                        collectionName: "{{ render(vars.collection) }}"
+                        vectorName: text_dense
+                        vector: "{{ fromJson(taskrun.value).dense }}"
+                        limit: "{{ inputs.k }}"
+                        fetchType: FETCH
+
+                      - id: sparse_only
+                        type: io.kestra.plugin.qdrant.SparseQuery
+                        host: "{{ secret('QDRANT_HOST') }}"
+                        apiKey: "{{ secret('QDRANT_API_KEY') }}"
+                        tlsEnabled: true
+                        collectionName: "{{ render(vars.collection) }}"
+                        vectorName: text_sparse
+                        indices: "{{ fromJson(taskrun.value).indices }}"
+                        values: "{{ fromJson(taskrun.value).values }}"
+                        limit: "{{ inputs.k }}"
+                        fetchType: FETCH
+
+                      - id: fused
+                        type: io.kestra.plugin.qdrant.HybridQuery
+                        host: "{{ secret('QDRANT_HOST') }}"
+                        apiKey: "{{ secret('QDRANT_API_KEY') }}"
+                        tlsEnabled: true
+                        collectionName: "{{ render(vars.collection) }}"
+                        denseVectorName: text_dense
+                        denseVector: "{{ fromJson(taskrun.value).dense }}"
+                        sparseVectorName: text_sparse
+                        sparseIndices: "{{ fromJson(taskrun.value).indices }}"
+                        sparseValues: "{{ fromJson(taskrun.value).values }}"
+                        limit: "{{ inputs.k }}"
+                        candidateLimit: 6
+                        fetchType: FETCH
+
+                      - id: score
+                        type: io.kestra.plugin.core.output.OutputValues
+                        values:
+                          name: "{{ fromJson(taskrun.value).name }}"
+                          dense_hit: "{{ outputs.dense_only[taskrun.value].rows | jq('if (map(.id) | index(' ~ fromJson(taskrun.value).relevant ~ ')) != null then 1 else 0 end') | first }}"
+                          sparse_hit: "{{ outputs.sparse_only[taskrun.value].rows | jq('if (map(.id) | index(' ~ fromJson(taskrun.value).relevant ~ ')) != null then 1 else 0 end') | first }}"
+                          fused_hit: "{{ outputs.fused[taskrun.value].rows | jq('if (map(.id) | index(' ~ fromJson(taskrun.value).relevant ~ ')) != null then 1 else 0 end') | first }}"
+
+                  - id: summary
+                    type: io.kestra.plugin.core.output.OutputValues
+                    values:
+                      queries: "{{ outputs.score | jq('length') | first }}"
+                      dense_hits: "{{ outputs.score | jq('[.[].values.dense_hit | tonumber] | add') | first }}"
+                      sparse_hits: "{{ outputs.score | jq('[.[].values.sparse_hit | tonumber] | add') | first }}"
+                      fused_hits: "{{ outputs.score | jq('[.[].values.fused_hit | tonumber] | add') | first }}"
+
+                  - id: report
+                    type: io.kestra.plugin.core.log.Log
+                    message: |
+                      hit@{{ inputs.k }} on {{ outputs.summary.values.queries }} labelled queries
+                      dense only : {{ outputs.summary.values.dense_hits }}
+                      sparse only: {{ outputs.summary.values.sparse_hits }}
+                      fused (RRF): {{ outputs.summary.values.fused_hits }}
+
+                finally:
+                  - id: drop_collection
+                    type: io.kestra.plugin.qdrant.DeleteCollection
+                    host: "{{ secret('QDRANT_HOST') }}"
+                    apiKey: "{{ secret('QDRANT_API_KEY') }}"
+                    tlsEnabled: true
+                    collectionName: "{{ render(vars.collection) }}"
+                """
+        ),
+        @Example(
             title = "Compare dense-only retrieval with fused retrieval on the same query, then store the fused ranking",
             full = true,
             code = """
@@ -119,7 +265,7 @@ import java.util.Map;
                   - id: compare
                     type: io.kestra.plugin.core.log.Log
                     message: |
-                      dense-only ids: {{ outputs.dense_only.rows | jq('[.[].id]') }}
+                      dense-only ids: {{ outputs.dense_only[taskrun.value].rows | jq('[.[].id]') }}
                       fused ranking stored at: {{ outputs.hybrid.uri }}
                 """
         )
@@ -379,18 +525,6 @@ public class HybridQuery extends QdrantConnection implements RunnableTask<FetchO
             builder.setFilter(filter);
         }
         return builder.build();
-    }
-
-    private static List<Object> renderList(RunContext runContext, Property<List<Object>> property, String name)
-        throws IllegalVariableEvaluationException {
-        if (property == null) {
-            throw new IllegalArgumentException("'" + name + "' is required");
-        }
-        var rList = runContext.render(property).asList(Object.class);
-        if (rList == null) {
-            throw new IllegalArgumentException("'" + name + "' is required");
-        }
-        return rList;
     }
 
     private static int renderBoundedLimit(RunContext runContext, Property<Integer> property, String name, int defaultValue, int max)

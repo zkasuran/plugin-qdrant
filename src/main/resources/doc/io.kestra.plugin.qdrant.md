@@ -19,6 +19,7 @@ All tasks inherit common connection properties:
 - `Upsert`: Upserts points with vector embeddings (single dense vector, or a named vectors map whose entries are dense lists or sparse `indices` and `values` maps) and metadata payloads. Supports streaming batch processing from inline lists or Kestra storage URIs (`kestra://`).
 - `Get`: Retrieves points by their IDs with options to include payloads and vector embeddings. Outputs results inline (`FETCH`), as a single record (`FETCH_ONE`), or to Kestra internal storage (`STORE`).
 - `Query`: Performs vector similarity searches using either a raw embedding vector (`vector`) or an existing point ID (`vectorId`). Supports target vector space (`vectorName`) for collections using named vectors, result count limits (`limit`, with `topK` supported as an alias; `limit` takes precedence), score thresholds, payload filters, and fetch output modes (`FETCH`, `FETCH_ONE`, `STORE`).
+- `SparseQuery`: Searches one named sparse vector space with a sparse query vector and returns the nearest points. It is the sparse-only counterpart of `Query`, used next to `Query` and `HybridQuery` to compare retrieval methods. See [Hybrid retrieval](#hybrid-retrieval).
 - `HybridQuery`: Queries one named dense vector space and one named sparse vector space in a single request and lets Qdrant fuse both candidate lists with Reciprocal Rank Fusion. See [Hybrid retrieval](#hybrid-retrieval).
 - `Delete`: Deletes points by specific point IDs or matching filter criteria (mutually exclusive).
 
@@ -45,6 +46,12 @@ All tasks inherit common connection properties:
 ### Filters
 
 `filter` accepts the same shapes as `Query` and is applied to both prefetch branches and to the fused query, so a point excluded by the filter can enter neither candidate list. Because the filter changes each branch ranking, filtered fusion scores differ from unfiltered ones for the same points. An empty result is a valid outcome in every fetch mode.
+
+### Evaluating hybrid retrieval
+
+Run the same labelled queries through `Query` (dense), `SparseQuery` (sparse) and `HybridQuery` (fused) and compare how often the relevant point lands in the first results. The `HybridQuery` example `qdrant_retrieval_evaluation` does exactly that and reports `hit@k` per method: it creates a throwaway collection, loads a small corpus, scores each labelled query and always drops the collection, even when a step fails.
+
+The bundled corpus and queries are synthetic and are built so that the three methods disagree. They show how to measure, not that fusion wins. On your own data fusion can match or trail the better single method, so replace the corpus and the `queries` input with your own labelled queries and read the numbers before adopting hybrid retrieval.
 
 ### Scope
 
